@@ -39,19 +39,10 @@ public struct MiniMaxH3AudioConditioningEncoder {
     let channels = try AudioInput.readChannels(
       contentsOf: path, sampleRate: 32_000,
       channelCount: 2, maximumFrames: 480_000)
-    guard (64_000...480_000).contains(channels[0].count) else {
-      throw MiniMaxH3AudioConditioningError.invalidDuration
-    }
     return try encode(channels: channels)
   }
 
   public func encode(channels: [[Float]]) throws -> Tensor<FloatType> {
-    guard channels.count == 2, channels[0].count == channels[1].count,
-      (64_000...480_000).contains(channels[0].count),
-      channels.allSatisfy({ $0.allSatisfy(\.isFinite) })
-    else {
-      throw MiniMaxH3AudioConditioningError.invalidDuration
-    }
     let mean: [Double]
     let std: [Double]
     let archives: [SafeTensors]

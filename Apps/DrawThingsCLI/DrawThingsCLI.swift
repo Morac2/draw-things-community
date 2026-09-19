@@ -4417,11 +4417,7 @@ extension DrawThingsCLI {
         let videoFrames = max(Int(configuration.numFrames), 1)
         let audioInput = try AudioInput(
           contentsOf: audioPath,
-          sampleRate: ModelZoo.audioSampleRateForModel(configuration.model ?? ""),
-          maximumFrames: modelSpecification.version == .minimaxH3 ? 480_000 : nil)
-        if modelSpecification.version == .minimaxH3, audioInput.waveform.shape[1] < 64_000 {
-          throw MiniMaxH3AudioConditioningError.invalidDuration
-        }
+          sampleRate: ModelZoo.audioSampleRateForModel(configuration.model ?? ""))
         context.print("Loading audio: \(audioPath)")
         audio = audioInput.waveform
         if modelSpecification.version == .longcatVideoAvatar1_5 {
