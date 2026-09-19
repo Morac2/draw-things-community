@@ -48,6 +48,13 @@ let package = Package(
       revision: "948991e19e795cdd7bd310756a97b5fbda559535"),
   ],
   targets: [
+    .testTarget(
+      name: "H3AudioReferenceTests",
+      dependencies: ["AudioConverter", "Diffusion", .product(name: "NNC", package: "s4nnc")],
+      path: "Libraries/AudioConverter/Tests",
+      exclude: ["AudioInputTests.swift", "LongCatAudioConditioningTests.swift"],
+      sources: ["MiniMaxH3AudioReferenceTests.swift"]
+    ),
     .target(
       name: "Utils",
       path: "Libraries/Utils/Sources"

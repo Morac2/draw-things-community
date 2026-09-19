@@ -76,6 +76,7 @@ swift_binary(
 
 swift_library(
     name = "DrawThingsCLILib",
+    module_name = "DrawThingsCLILib",
     srcs = glob(["DrawThingsCLI/*.swift"]),
     visibility = ["//Apps:__subpackages__"],
     deps = [
@@ -103,7 +104,7 @@ swift_library(
 
 swift_binary(
     name = "DrawThingsCLI",
-    srcs = [],
+    srcs = ["DrawThingsCLI/Executable/Main.swift"],
     visibility = ["//visibility:public"],
     deps = [
         ":DrawThingsCLILib",

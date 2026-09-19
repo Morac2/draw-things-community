@@ -11,6 +11,7 @@ public enum AudioInputError: Swift.Error, LocalizedError {
   case cannotReadAudio(String)
   case cannotConvertAudio
   case invalidSampleRate(Int)
+  case exceedsMaximumDuration(Double)
 
   public var errorDescription: String? {
     switch self {
@@ -22,6 +23,8 @@ public enum AudioInputError: Swift.Error, LocalizedError {
       return "Cannot read audio file at \(path)."
     case .cannotConvertAudio:
       return "Cannot convert audio to PCM."
+    case .exceedsMaximumDuration(let seconds):
+      return "Reference audio exceeds the maximum duration of \(seconds) seconds."
     case .invalidSampleRate(let sampleRate):
       return "Audio sample rate must be positive, but received \(sampleRate) Hz."
     }
@@ -65,7 +68,22 @@ public struct AudioInput {
     return tensor
   }
 
-  public init(contentsOf path: String, sampleRate: Int) throws {
+  public init(contentsOf path: String, sampleRate: Int, maximumFrames: Int? = nil) throws {
+    let channels = try Self.readChannels(
+      contentsOf: path, sampleRate: sampleRate,
+      maximumFrames: maximumFrames)
+    self.init(
+      waveform: Tensor<Float>(
+        channels.flatMap { $0 }, .CPU,
+        .NC(channels.count, channels[0].count)), sampleRate: sampleRate)
+  }
+
+  /// Decode planar PCM without collapsing stereo reference audio to mono.
+  public static func readChannels(
+    contentsOf path: String, sampleRate: Int, channelCount: Int? = nil,
+    maximumFrames: Int? = nil
+  ) throws -> [[Float]] {
+    precondition(channelCount == nil || channelCount == 1 || channelCount == 2)
     guard sampleRate > 0 else {
       throw AudioInputError.invalidSampleRate(sampleRate)
     }
@@ -74,17 +92,18 @@ public struct AudioInput {
       guard let file = try? AVAudioFile(forReading: url) else {
         throw AudioInputError.cannotOpenAudio(path)
       }
-      let channelCount = min(file.processingFormat.channelCount, 2)
+      let channelCount = channelCount ?? min(Int(file.processingFormat.channelCount), 2)
       guard
         let outputFormat = AVAudioFormat(
-          commonFormat: .pcmFormatFloat32, sampleRate: Double(sampleRate), channels: channelCount,
+          commonFormat: .pcmFormatFloat32, sampleRate: Double(sampleRate),
+          channels: AVAudioChannelCount(channelCount),
           interleaved: false),
         let converter = AVAudioConverter(from: file.processingFormat, to: outputFormat)
       else {
         throw AudioInputError.cannotConvertAudio
       }
       let inputCapacity: AVAudioFrameCount = 65_536
-      var samples = Array(repeating: [Float](), count: Int(channelCount))
+      var samples = [[Float]](repeating: [], count: channelCount)
       var inputEnded = false
       var readError: AudioInputError? = nil
       let ratio = Double(sampleRate) / file.processingFormat.sampleRate
@@ -138,10 +157,13 @@ public struct AudioInput {
           return inputBuffer
         }
         if let channelData = outputBuffer.floatChannelData, outputBuffer.frameLength > 0 {
-          for channel in 0..<Int(channelCount) {
+          for channel in 0..<channelCount {
             samples[channel].append(
               contentsOf: UnsafeBufferPointer(
                 start: channelData[channel], count: Int(outputBuffer.frameLength)))
+          }
+          if let maximumFrames, samples[0].count > maximumFrames {
+            throw AudioInputError.exceedsMaximumDuration(Double(maximumFrames) / Double(sampleRate))
           }
         }
         if let readError {
@@ -161,12 +183,10 @@ public struct AudioInput {
           throw AudioInputError.cannotConvertAudio
         }
       }
-      guard let sampleCount = samples.first?.count, sampleCount > 0 else {
+      guard !samples[0].isEmpty else {
         throw AudioInputError.cannotConvertAudio
       }
-      self.init(
-        waveform: Tensor<Float>(samples.flatMap { $0 }, .CPU, .NC(Int(channelCount), sampleCount)),
-        sampleRate: sampleRate)
+      return samples
     #else
       throw AudioInputError.unsupportedPlatform
     #endif

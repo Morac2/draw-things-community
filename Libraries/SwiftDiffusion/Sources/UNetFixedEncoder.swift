@@ -375,6 +375,11 @@ extension UNetFixedEncoder {
         noise.randn()
         return 0.999 * image + 0.001 * noise
       }
+      let referenceAudios = referenceAudios.map { audio in
+        let noise = graph.variable(like: audio)
+        noise.randn()
+        return 0.999 * audio + 0.001 * noise
+      }
       let (rankOfLoRA, filesRequireMerge) = LoRALoader.rank(
         graph, of: lora.map { $0.file }, modelFile: filePath)
       let isLoHa = lora.contains { $0.isLoHa }

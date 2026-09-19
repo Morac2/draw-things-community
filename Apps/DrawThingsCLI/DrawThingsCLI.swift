@@ -575,13 +575,13 @@ struct GenerateImageInputOptions: ParsableArguments {
 
   @Option(
     name: .long,
-    help: "Audio file for LongCat driving audio or MiniMax H3 Ref2VA native audio references.")
+    help: "Audio file for LongCat driving audio or a 2–15 second MiniMax H3 Ref2VA reference.")
   var audio: String?
 
   @Option(
     name: .customLong("audio-encoder-file"),
     help:
-      "Audio encoder checkpoint filename in the models directory (defaults to the model's encoder)."
+      "Audio encoder checkpoint (defaults to the model's encoder), or an original audio_vae directory for H3. Relative paths resolve in the models directory."
   )
   var audioEncoderFile: String?
 }
@@ -4331,9 +4331,19 @@ extension DrawThingsCLI {
         {
           throw ValidationError("--audio requires a MiniMax H3 Ref2VA checkpoint.")
         }
-        let encoderFile = imageInput.audioEncoderFile ?? defaultEncoder
-        if !files.contains(encoderFile) { files.append(encoderFile) }
-        fileMapping[defaultEncoder] = modelsDirectory.appendingPathComponent(encoderFile).path
+        if modelSpecification.version == .minimaxH3, let override = imageInput.audioEncoderFile {
+          let encoderURL =
+            override.hasPrefix("/")
+            ? URL(fileURLWithPath: override) : modelsDirectory.appendingPathComponent(override)
+          guard FileManager.default.fileExists(atPath: encoderURL.path) else {
+            throw ValidationError("H3 audio encoder does not exist at \(encoderURL.path).")
+          }
+          fileMapping[defaultEncoder] = encoderURL.path
+        } else {
+          let encoderFile = imageInput.audioEncoderFile ?? defaultEncoder
+          if !files.contains(encoderFile) { files.append(encoderFile) }
+          fileMapping[defaultEncoder] = modelsDirectory.appendingPathComponent(encoderFile).path
+        }
       }
 
       if imageInput.audio != nil && imagePath == nil
@@ -4407,7 +4417,11 @@ extension DrawThingsCLI {
         let videoFrames = max(Int(configuration.numFrames), 1)
         let audioInput = try AudioInput(
           contentsOf: audioPath,
-          sampleRate: ModelZoo.audioSampleRateForModel(configuration.model ?? ""))
+          sampleRate: ModelZoo.audioSampleRateForModel(configuration.model ?? ""),
+          maximumFrames: modelSpecification.version == .minimaxH3 ? 480_000 : nil)
+        if modelSpecification.version == .minimaxH3, audioInput.waveform.shape[1] < 64_000 {
+          throw MiniMaxH3AudioConditioningError.invalidDuration
+        }
         context.print("Loading audio: \(audioPath)")
         audio = audioInput.waveform
         if modelSpecification.version == .longcatVideoAvatar1_5 {

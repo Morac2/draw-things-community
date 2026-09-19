@@ -78,6 +78,12 @@ final class AudioInputTests: XCTestCase {
       XCTAssertEqual(input.waveform.shape[0], 2)
       XCTAssertEqual(input.waveform[0, 800], 0.25, accuracy: 0.005)
       XCTAssertEqual(input.waveform[1, 800], 0.5, accuracy: 0.005)
+      XCTAssertThrowsError(
+        try AudioInput(contentsOf: url.path, sampleRate: 16_000, maximumFrames: 100))
+      let stereo = try AudioInput.readChannels(
+        contentsOf: url.path, sampleRate: 16_000, channelCount: 2)
+      XCTAssertEqual(stereo[0][800], 0.25, accuracy: 0.005)
+      XCTAssertEqual(stereo[1][800], 0.5, accuracy: 0.005)
       let exported = input.waveformTensor(videoFrames: 1, framesPerSecond: 10)
       XCTAssertEqual(exported[0, 800], 0.25, accuracy: 0.005)
       XCTAssertEqual(exported[1, 800], 0.5, accuracy: 0.005)

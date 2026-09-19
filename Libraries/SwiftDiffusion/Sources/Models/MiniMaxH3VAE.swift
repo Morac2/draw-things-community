@@ -2,6 +2,118 @@
 import Foundation
 import NNC
 
+/// AudioVAE posterior mean before latent normalization. Input is stereo NCHW
+/// [2, 1, 1, samples], zero-padded to a multiple of 800; output is [2, T, 32].
+/// The encoder uses Snake1d (not the decoder's anti-aliased SnakeBeta).
+/// Ported against antirez/h3.c; see Libraries/AudioConverter/H3_AUDIO_REFERENCE.md.
+public func MiniMaxH3AudioEncoder(samples: Int) -> (ModelWeightMapper, Model) {
+  precondition(samples > 0 && samples % 800 == 0)
+  let x = Input()
+  let causalMask = Input()
+  var parameters = [(String, Model.Parameters)]()
+  func convolution(
+    _ prefix: String, channels: Int, kernel: Int, stride: Int = 1,
+    dilation: Int = 1, padding: Int, name: String
+  ) -> Model {
+    let conv = Convolution(
+      groups: 1, filters: channels, filterSize: [1, kernel], dilation: [1, dilation],
+      hint: Hint(
+        stride: [1, stride],
+        border: Hint.Border(begin: [0, padding], end: [0, padding])), name: name)
+    parameters.append(("\(prefix).weight", conv.weight))
+    parameters.append(("\(prefix).bias", conv.bias))
+    return conv
+  }
+  func snake(_ input: Model.IO, channels: Int, prefix: String, name: String) -> Model.IO {
+    let alpha = Parameter<Float>(
+      .GPU(0), .NCHW(1, channels, 1, 1),
+      trainable: false, name: "\(name)_alpha")
+    parameters.append(("\(prefix).alpha", alpha.weight))
+    return input + (input .* alpha).sin().pow(2) .* (1 / (alpha + 1e-9))
+  }
+  func dense(_ prefix: String, count: Int, noBias: Bool = false, name: String) -> Model {
+    let layer = Dense(count: count, noBias: noBias, name: name)
+    parameters.append(("\(prefix).weight", layer.weight))
+    if !noBias { parameters.append(("\(prefix).bias", layer.bias)) }
+    return layer
+  }
+  func norm(_ prefix: String, name: String) -> Model {
+    let layer = LayerNorm(epsilon: 1e-5, axis: [2], name: name)
+    parameters.append(("\(prefix).weight", layer.weight))
+    parameters.append(("\(prefix).bias", layer.bias))
+    return layer
+  }
+  var out = convolution(
+    "encoder.block.0", channels: 64, kernel: 7, padding: 3, name: "encoder_input")(x)
+  var channels = 64
+  for (index, stride) in [2, 4, 4, 5, 5].enumerated() {
+    let prefix = "encoder.block.\(index + 1).block"
+    for (residual, dilation) in [1, 3, 9].enumerated() {
+      let block = "\(prefix).\(residual).block"
+      var branch = snake(
+        out, channels: channels, prefix: "\(block).0",
+        name: "encoder_block_\(index)_res\(residual)_snake1")
+      branch = convolution(
+        "\(block).1", channels: channels, kernel: 7,
+        dilation: dilation, padding: 3 * dilation,
+        name: "encoder_block_\(index)_res\(residual)_conv1")(branch)
+      branch = snake(
+        branch, channels: channels, prefix: "\(block).2",
+        name: "encoder_block_\(index)_res\(residual)_snake2")
+      out =
+        out
+        + convolution(
+          "\(block).3", channels: channels, kernel: 1, padding: 0,
+          name: "encoder_block_\(index)_res\(residual)_conv2")(branch)
+    }
+    out = snake(
+      out, channels: channels, prefix: "\(prefix).3", name: "encoder_block_\(index)_snake")
+    channels *= 2
+    out = convolution(
+      "\(prefix).4", channels: channels, kernel: 2 * stride,
+      stride: stride, padding: (stride + 1) / 2, name: "encoder_block_\(index)_downsample")(out)
+  }
+  out = snake(out, channels: channels, prefix: "encoder.block.6", name: "encoder_final_snake")
+  out = convolution(
+    "encoder.block.7", channels: channels, kernel: 3, padding: 1, name: "encoder_final_conv")(out)
+  let length = samples / 800
+  let hidden = out.reshaped([2, 2_048, length]).permuted(0, 2, 1).contiguous()
+  var base = dense("pre_block.proj", count: 32, name: "input_projection")(
+    norm("pre_block.norm3", name: "norm3")(hidden))
+  let normalized = norm("pre_block.norm1", name: "norm1")(hidden)
+  let qkv = dense("pre_block.attn.qkv", count: 6_144, name: "qkv")(normalized)
+  let projections = (0..<3).map { index in
+    qkv.reshaped(
+      [2, length, 2_048], offset: [0, 0, index * 2_048],
+      strides: [length * 6_144, 6_144, 1]
+    ).contiguous()
+      .reshaped(.NHWC(2, length, 8, 256))
+  }
+  // Explicit masking also preserves causality on the MPS fallback backend.
+  let scores =
+    Matmul(transposeB: (2, 3))(
+      (1.0 / 16) * projections[0].transposed(1, 2), projections[1].transposed(1, 2)) + causalMask
+  let probabilities = scores.reshaped([2 * 8 * length, length]).softmax()
+    .reshaped([2, 8, length, length])
+  let attended = Matmul()(probabilities, projections[2].transposed(1, 2))
+    .transposed(1, 2).contiguous()
+  // Pool contiguous groups of eight within each head, then average the heads.
+  let pooled = attended.reshaped([2, length, 8, 32, 8])
+    .reduced(.mean, axis: [2, 4]).reshaped([2, length, 32])
+  base = base + dense("pre_block.attn.proj", count: 32, name: "attention_output")(pooled)
+  let mlp = norm("pre_block.mlp.norm", name: "mlp_norm")(
+    norm("pre_block.norm2", name: "norm2")(base))
+  let gate = dense("pre_block.mlp.w0", count: 64, name: "mlp_gate")(mlp).GELU(approximate: .tanh)
+  let value = dense("pre_block.mlp.w1", count: 64, name: "mlp_up")(mlp)
+  base = base + dense("pre_block.mlp.w2", count: 32, name: "mlp_down")(gate .* value)
+  let result = dense("mean_proj", count: 32, name: "mean_proj")(base)
+  return (
+    { _ in
+      Dictionary(uniqueKeysWithValues: parameters.map { ($0.0, ModelWeightElement([$0.1.name])) })
+    }, Model([x, causalMask], [result])
+  )
+}
+
 private func MiniMaxH3VideoEncoderResnetBlock(
   inChannels: Int, outChannels: Int, frames: Int, height: Int, width: Int
 ) -> Model {

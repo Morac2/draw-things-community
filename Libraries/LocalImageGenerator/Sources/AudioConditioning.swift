@@ -68,45 +68,26 @@ extension LocalImageGenerator {
       else { return nil }
       let isCancelled = ManagedAtomic(false)
       cancellation { isCancelled.store(true, ordering: .releasing) }
-      let sampleCount = audio.waveform.shape[1]
-      let inputLength = (sampleCount + 799) / 800 * 800
-      let latentLength = inputLength / 800
-      let encoder = MiniMaxH3AudioEncoder(inputLength: inputLength)
-      encoder.maxConcurrency = .limit(4)
-      var latents = Tensor<Float>(.CPU, .HWC(1, 2 * latentLength, 32))
-      for channel in 0..<audio.waveform.shape[0] {
-        guard !isCancelled.load(ordering: .acquiring) else { return nil }
-        var waveform = Tensor<Float>(
-          Array(repeating: 0, count: inputLength), .CPU, .NCHW(1, 1, 1, inputLength))
-        waveform[0..<1, 0..<1, 0..<1, 0..<sampleCount] = audio.waveform[
-          channel..<(channel + 1), 0..<sampleCount
-        ].copied().reshaped(.NCHW(1, 1, 1, sampleCount))
-        let input = graph.variable(waveform.toGPU(0))
-        if channel == 0 {
-          encoder.compile(inputs: input)
-          graph.openStore(
-            filePath, flags: .readOnly,
-            externalStore: TensorData.externalStore(filePath: filePath)
-          ) { store in
-            try! store.read(
-              "audio_encoder", model: encoder, strict: true, codec: [.ezm7, .externalData])
-          }
-        }
-        let encoded = encoder(inputs: input)[0].as(of: Float.self).rawValue.toCPU()
-        guard !isCancelled.load(ordering: .acquiring) else { return nil }
-        // Native Ref2VA uses the posterior mean, with independent left/right channels.
-        for row in 0..<latentLength {
-          for feature in 0..<32 {
-            latents[0, channel * latentLength + row, feature] =
-              (encoded[0, row, feature] - mean[feature]) / std[feature]
-          }
+      guard !isCancelled.load(ordering: .acquiring) else { return nil }
+      let channels = audio.waveform.copied().withUnsafeBytes { bytes -> [[Float]] in
+        let samples = bytes.bindMemory(to: Float.self)
+        let length = audio.waveform.shape[1]
+        return (0..<2).map { channel in
+          let offset = min(channel, audio.waveform.shape[0] - 1) * length
+          return Array(samples[offset..<(offset + length)])
         }
       }
-      if audio.waveform.shape[0] == 1 {
-        latents[0..<1, latentLength..<(2 * latentLength), 0..<32] =
-          latents[0..<1, 0..<latentLength, 0..<32].copied()
+      let encoder: MiniMaxH3AudioConditioningEncoder
+      if URL(fileURLWithPath: filePath).pathExtension == "ckpt" {
+        encoder = MiniMaxH3AudioConditioningEncoder(
+          filePath: filePath, latentsMean: mean, latentsStd: std)
+      } else {
+        encoder = MiniMaxH3AudioConditioningEncoder(directory: URL(fileURLWithPath: filePath))
       }
-      return [graph.variable(Tensor<FloatType>(from: latents).toGPU(0))]
+      guard let latents = try? encoder.encode(channels: channels),
+        !isCancelled.load(ordering: .acquiring)
+      else { return nil }
+      return [graph.variable(latents.toGPU(0))]
     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v,
       .wurstchenStageC, .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large,
       .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage,
